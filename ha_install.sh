@@ -136,76 +136,75 @@ echo "Detected Python ${PYTHON_VERSION}"
 pkg_install_optional python3-pynacl
 pkg_install_optional python3-ciso8601
 
-# Core packages — required for HA to work
-pkg_install \
-  patch \
-  unzip \
-  libjpeg-turbo \
-  python3-aiohttp \
-  python3-aiohttp-cors \
-  python3-async-timeout \
-  python3-asyncio \
-  python3-attrs \
-  python3-certifi \
-  python3-cffi \
-  python3-codecs \
-  python3-cryptography \
-  python3-ctypes \
-  python3-dateutil \
-  python3-dbm \
-  python3-decimal \
-  python3-defusedxml \
-  python3-email \
-  python3-greenlet \
-  python3-idna \
-  python3-jinja2 \
-  python3-light \
-  python3-logging \
-  python3-lzma \
-  python3-markupsafe \
-  python3-multidict \
-  python3-multiprocessing \
-  python3-ncurses \
-  python3-openssl \
-  python3-pillow \
-  python3-pip \
-  python3-pkg-resources \
-  python3-pycparser \
-  python3-pydoc \
-  python3-pyopenssl \
-  python3-pytz \
-  python3-requests \
-  python3-setuptools \
-  python3-six \
-  python3-slugify \
-  python3-sqlalchemy \
-  python3-sqlite3 \
-  python3-uuid \
-  python3-unittest \
-  python3-urllib \
-  python3-urllib3 \
-  python3-xml \
-  python3-yaml \
-  python3-yarl
+# System tools — these should always be available
+pkg_install patch unzip libjpeg-turbo
 
-# Optional packages — may not exist in all OpenWrt versions/architectures
+# Python packages — install as optional since OpenWrt 25.12.5 feed
+# is missing many packages (aiohttp, multidict, yarl, etc.)
+# Missing packages will be installed via pip3 below.
+pkg_install_optional python3-aiohttp
+pkg_install_optional python3-aiohttp-cors
+pkg_install_optional python3-async-timeout
+pkg_install_optional python3-asyncio
+pkg_install_optional python3-attrs
 pkg_install_optional python3-bcrypt
 pkg_install_optional python3-boto3
 pkg_install_optional python3-botocore
+pkg_install_optional python3-certifi
+pkg_install_optional python3-cffi
 pkg_install_optional python3-cgi
 pkg_install_optional python3-cgitb
 pkg_install_optional python3-chardet
+pkg_install_optional python3-codecs
 pkg_install_optional python3-cryptodome
 pkg_install_optional python3-cryptodomex
+pkg_install_optional python3-cryptography
+pkg_install_optional python3-ctypes
+pkg_install_optional python3-dateutil
+pkg_install_optional python3-dbm
+pkg_install_optional python3-decimal
+pkg_install_optional python3-defusedxml
 pkg_install_optional python3-distutils
 pkg_install_optional python3-docutils
+pkg_install_optional python3-email
+pkg_install_optional python3-greenlet
+pkg_install_optional python3-idna
+pkg_install_optional python3-jinja2
 pkg_install_optional python3-jmespath
+pkg_install_optional python3-light
+pkg_install_optional python3-logging
+pkg_install_optional python3-lzma
+pkg_install_optional python3-markupsafe
+pkg_install_optional python3-multidict
+pkg_install_optional python3-multiprocessing
+pkg_install_optional python3-ncurses
 pkg_install_optional python3-netdisco
 pkg_install_optional python3-netifaces
+pkg_install_optional python3-openssl
+pkg_install_optional python3-pillow
+pkg_install_optional python3-pip
+pkg_install_optional python3-pkg-resources
 pkg_install_optional python3-ply
 pkg_install_optional python3-psutil
 pkg_install_optional python3-pycares
+pkg_install_optional python3-pycparser
+pkg_install_optional python3-pydoc
+pkg_install_optional python3-pyopenssl
+pkg_install_optional python3-pytz
+pkg_install_optional python3-requests
 pkg_install_optional python3-s3transfer
+pkg_install_optional python3-setuptools
+pkg_install_optional python3-six
+pkg_install_optional python3-slugify
+pkg_install_optional python3-sqlalchemy
+pkg_install_optional python3-sqlite3
+pkg_install_optional python3-unittest
+pkg_install_optional python3-urllib
+pkg_install_optional python3-urllib3
+pkg_install_optional python3-uuid
+pkg_install_optional python3-xml
+pkg_install_optional python3-yaml
+pkg_install_optional python3-yarl
 
 if [ $BROKEN_NUMPY ]; then
   # on intel N100 it might use missing CPU instructions. Remove it
@@ -230,26 +229,52 @@ echo "Install base requirements from PyPI..."
 pip3 install --no-cache-dir wheel
 
 # -----------------------------------------------------------------------
-# Install packages missing from the OpenWrt 25.12.5 feed via pip3
-# ciso8601 supports Python 3.11+ (C extension, compiles cleanly on 3.13)
-# pynacl is installable via pip3 (requires libsodium)
+# Install packages missing from the OpenWrt 25.12.5 APK feed via pip3.
+# Many python3-* opkg packages are absent in the 25.12.5 APK-based feed.
+# Each check: import first (from apk), fallback to pip3 if missing.
 # -----------------------------------------------------------------------
 echo "Installing feed-missing packages via pip3..."
 
 # ciso8601: required by Home Assistant for datetime parsing
 python3 -c "import ciso8601" 2>/dev/null || \
   pip3 install --no-cache-dir "ciso8601>=2.3.0" || \
-  echo "WARNING: ciso8601 not installed. HA datetime parsing may be slow."
+  echo "WARNING: ciso8601 not installed."
 
-# pynacl: required by mobile_app integration
-python3 -c "import nacl" 2>/dev/null || {
-  pkg_install_optional libsodium
+# pynacl: required by mobile_app (libsodium already installed from apk above)
+python3 -c "import nacl" 2>/dev/null || \
   pip3 install --no-cache-dir "pynacl" || \
-    echo "WARNING: pynacl not installed. mobile_app integration may not work."
-}
+  echo "WARNING: pynacl not installed."
+
+# aiohttp + critical dependencies (HA web server)
+python3 -c "import multidict" 2>/dev/null || pip3 install --no-cache-dir multidict || true
+python3 -c "import yarl" 2>/dev/null || pip3 install --no-cache-dir yarl || true
+python3 -c "import aiohttp" 2>/dev/null || pip3 install --no-cache-dir "aiohttp>=3.8,<4" || true
+python3 -c "import aiohttp_cors" 2>/dev/null || pip3 install --no-cache-dir aiohttp-cors || true
+
+# Other packages that may be missing from feed
+python3 -c "import async_timeout" 2>/dev/null || pip3 install --no-cache-dir async-timeout || true
+python3 -c "import attr" 2>/dev/null || pip3 install --no-cache-dir attrs || true
+python3 -c "import certifi" 2>/dev/null || pip3 install --no-cache-dir certifi || true
+python3 -c "import cryptography" 2>/dev/null || pip3 install --no-cache-dir cryptography || true
+python3 -c "import dateutil" 2>/dev/null || pip3 install --no-cache-dir python-dateutil || true
+python3 -c "import defusedxml" 2>/dev/null || pip3 install --no-cache-dir defusedxml || true
+python3 -c "import greenlet" 2>/dev/null || pip3 install --no-cache-dir greenlet || true
+python3 -c "import idna" 2>/dev/null || pip3 install --no-cache-dir idna || true
+python3 -c "import jinja2" 2>/dev/null || pip3 install --no-cache-dir jinja2 || true
+python3 -c "import markupsafe" 2>/dev/null || pip3 install --no-cache-dir markupsafe || true
+python3 -c "import OpenSSL" 2>/dev/null || pip3 install --no-cache-dir pyOpenSSL || true
+python3 -c "import PIL" 2>/dev/null || pip3 install --no-cache-dir Pillow || true
+python3 -c "import pytz" 2>/dev/null || pip3 install --no-cache-dir pytz || true
+python3 -c "import requests" 2>/dev/null || pip3 install --no-cache-dir requests || true
+python3 -c "import setuptools" 2>/dev/null || pip3 install --no-cache-dir setuptools || true
+python3 -c "import six" 2>/dev/null || pip3 install --no-cache-dir six || true
+python3 -c "import slugify" 2>/dev/null || pip3 install --no-cache-dir python-slugify || true
+python3 -c "import sqlalchemy" 2>/dev/null || pip3 install --no-cache-dir sqlalchemy || true
+python3 -c "import urllib3" 2>/dev/null || pip3 install --no-cache-dir urllib3 || true
+python3 -c "import yaml" 2>/dev/null || pip3 install --no-cache-dir PyYAML || true
 
 pip3 freeze > /tmp/freeze.txt
-grep -E 'aiohttp|async-timeout|crypto|YAML' /tmp/freeze.txt > /tmp/owrt_constraints.txt
+grep -E 'aiohttp|async.timeout|multidict|yarl|crypto|YAML' /tmp/freeze.txt > /tmp/owrt_constraints.txt
 
 cat << EOF > /tmp/requirements_nodeps.txt
 $(version aioesphomeapi)
