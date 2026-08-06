@@ -8,12 +8,10 @@ get_ha_version()
 
 get_python_version()
 {
-  # Try apk first (OpenWrt 25.x), fall back to opkg (OpenWrt < 24)
-  if command -v apk > /dev/null 2>&1 && apk list --installed 2>/dev/null | grep -q python3-base; then
-    apk list --installed 2>/dev/null | grep python3-base | head -n 1 | grep -Eo '[[:digit:]]+\.[[:digit:]]+'
-  else
-    opkg list 2>/dev/null | grep python3-base | head -n 1 | grep -Eo '[[:digit:]]+\.[[:digit:]]+'
-  fi
+  # Detect Python version from installed python3 binary (call AFTER python3-base is installed)
+  python3 -c "import sys; print('{}.{}'.format(sys.version_info.major, sys.version_info.minor))" 2>/dev/null || \
+    python3 --version 2>&1 | grep -Eo '[[:digit:]]+\.[[:digit:]]+' | head -n 1 || \
+    echo "3.13"
 }
 
 get_version()
@@ -121,16 +119,20 @@ detect_pkg_manager
 echo "Using package manager: ${PKG_MANAGER}"
 pkg_update
 
-PYTHON_VERSION=$(get_python_version)
-echo "Detected Python ${PYTHON_VERSION}"
+# NOTE: PYTHON_VERSION detected AFTER python3-base is installed below
 LUMI_GATEWAY=$(is_lumi_gateway)
 GTW360_GATEWAY=$(is_gtw360)
 NEED_ZHA="$LUMI_GATEWAY$GTW360_GATEWAY"
 
-# Install base packages.
-# NOTE: python3-ciso8601 and python3-pynacl are NOT in OpenWrt 25.12.5 feed;
-# they will be installed via pip3 below as a fallback.
+# Install python3-base FIRST, then detect version
 pkg_install python3-base
+
+# Detect Python version now that python3-base is installed
+PYTHON_VERSION=$(get_python_version)
+echo "Detected Python ${PYTHON_VERSION}"
+
+# python3-ciso8601 and python3-pynacl are NOT in OpenWrt 25.12.5 feed;
+# they will be installed via pip3 below as fallback.
 pkg_install_optional python3-pynacl
 pkg_install_optional python3-ciso8601
 
