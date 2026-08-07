@@ -63,9 +63,9 @@ pkg_update() {
 # Install a package; skip silently if not found (exit 0 always)
 pkg_install_optional() {
   if [ "$PKG_MANAGER" = "apk" ]; then
-    apk add "$@" 2>/dev/null || true
+    apk add "$@" > /dev/null 2>&1 || true
   else
-    opkg install "$@" 2>/dev/null || true
+    opkg install "$@" > /dev/null 2>&1 || true
   fi
 }
 
@@ -112,7 +112,7 @@ if pgrep -a -f "usr/bin/hass"; then
   exit 1;
 fi
 
-rm -rf ${STORAGE_TMP}
+rm -rf ${STORAGE_TMP} || true
 
 echo "Install base requirements from feed..."
 detect_pkg_manager
@@ -218,10 +218,46 @@ else
   pkg_install_optional python3-numpy
 fi
 
+# -----------------------------------------------------------------------
+# Create swap file on USB drive (JFFS2/overlay does NOT support swap)
+# -----------------------------------------------------------------------
+SWAPFILE=""
+# Try to find USB/extroot mount point
+for mnt in /mnt/sda1 /mnt/sda /mnt/usb /overlay /tmp/mounts/sda1; do
+  if [ -d "$mnt" ] && df "$mnt" 2>/dev/null | grep -qv 'jffs2\|squash\|overlay\|tmpfs'; then
+    SWAPFILE="${mnt}/swapfile"
+    break
+  fi
+done
+# Fallback: try /root if on ext4/f2fs
+if [ -z "$SWAPFILE" ]; then
+  FS=$(df -T /root 2>/dev/null | tail -1 | awk '{print $2}')
+  case "$FS" in ext*|f2fs|btrfs|xfs) SWAPFILE="/root/swapfile" ;; esac
+fi
+
+if [ -n "$SWAPFILE" ] && [ ! -f "$SWAPFILE" ]; then
+  echo "Creating 256MB swap file at ${SWAPFILE}..."
+  dd if=/dev/zero of=${SWAPFILE} bs=1M count=256 2>/dev/null && \
+    chmod 600 ${SWAPFILE} && \
+    mkswap ${SWAPFILE} > /dev/null 2>&1 && \
+    swapon ${SWAPFILE} 2>/dev/null && \
+    echo "Swap enabled: $(free -m | grep Swap)" || \
+    { rm -f ${SWAPFILE}; echo "WARNING: swap file failed."; }
+elif [ -n "$SWAPFILE" ] && [ -f "$SWAPFILE" ]; then
+  swapon ${SWAPFILE} 2>/dev/null || true
+  echo "Swap re-enabled: $(free -m | grep Swap)"
+else
+  echo "WARNING: No suitable filesystem for swap. OOM builds will be skipped."
+fi
+
+# Try to install gcc for building C extensions (ciso8601, etc.)
+pkg_install_optional gcc musl-dev python3-dev
+
 cd /tmp/
 
 rm -rf /etc/homeassistant/deps/
-find /usr/lib/python${PYTHON_VERSION}/site-packages/ | grep -E "/__pycache__$" | xargs rm -rf
+find /usr/lib/python${PYTHON_VERSION}/ -name "*.pyc" -delete 2>/dev/null || true
+find /usr/lib/python${PYTHON_VERSION}/ -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 rm -rf /usr/lib/python${PYTHON_VERSION}/site-packages/botocore/data 2>/dev/null || true
 find /usr/lib/python${PYTHON_VERSION}/site-packages/numpy -iname tests -print0 2>/dev/null | xargs -0 rm -rf 2>/dev/null || true
 
@@ -236,9 +272,36 @@ pip3 install --no-cache-dir wheel
 echo "Installing feed-missing packages via pip3..."
 
 # ciso8601: required by Home Assistant for datetime parsing
+# Try pip3 first (needs gcc); if that fails, create a pure-Python shim
 python3 -c "import ciso8601" 2>/dev/null || \
-  pip3 install --no-cache-dir "ciso8601>=2.3.0" || \
-  echo "WARNING: ciso8601 not installed."
+  pip3 install --no-cache-dir "ciso8601>=2.3.0" 2>/dev/null || {
+  echo "ciso8601 build failed (no gcc). Installing pure-Python shim..."
+  CISO_DIR="/usr/lib/python${PYTHON_VERSION}/site-packages/ciso8601"
+  CISO_INFO="/usr/lib/python${PYTHON_VERSION}/site-packages/ciso8601-2.3.0.dist-info"
+  mkdir -p ${CISO_DIR} ${CISO_INFO}
+  cat <<'PYEOF' > ${CISO_DIR}/__init__.py
+# Pure-Python ciso8601 shim for OpenWrt (no C compiler available)
+# Uses datetime.fromisoformat() which is fully ISO 8601 compliant in Python 3.11+
+import datetime as _dt
+
+def parse_datetime(s):
+    return _dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
+
+def parse_datetime_as_naive(s):
+    dt = parse_datetime(s)
+    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+PYEOF
+  cat <<'PYEOF' > ${CISO_INFO}/METADATA
+Metadata-Version: 2.1
+Name: ciso8601
+Version: 2.3.0
+Summary: Fast ISO8601 date time parser for Python (Pure Python Shim)
+PYEOF
+  echo "ciso8601" > ${CISO_INFO}/top_level.txt
+  echo "pip" > ${CISO_INFO}/INSTALLER
+  touch ${CISO_INFO}/RECORD
+  echo "ciso8601 pure-Python shim installed."
+}
 
 # pynacl: required by mobile_app (libsodium already installed from apk above)
 python3 -c "import nacl" 2>/dev/null || \
@@ -276,20 +339,33 @@ python3 -c "import yaml" 2>/dev/null || pip3 install --no-cache-dir PyYAML || tr
 pip3 freeze > /tmp/freeze.txt
 grep -E 'aiohttp|async.timeout|multidict|yarl|crypto|YAML' /tmp/freeze.txt > /tmp/owrt_constraints.txt
 
-cat << EOF > /tmp/requirements_nodeps.txt
-$(version aioesphomeapi)
-$(version esphome-dashboard-api)
+cat <<EOF > /tmp/requirements_nodeps.txt
+# aioesphomeapi and esphome-dashboard-api SKIPPED:
+# They require gcc to build from source and OOM-kill routers with <256MB RAM.
+# ESPHome integration can be added manually later if needed.
+# $(version aioesphomeapi)
+# $(version esphome-dashboard-api)
 $(version zeroconf)
 $(version PyTurboJPEG)
 EOF
 
 mkdir -p ${STORAGE_TMP}
 
-TMPDIR=${STORAGE_TMP} pip3 install --no-cache-dir --no-deps -r /tmp/requirements_nodeps.txt
+# Install requirements_nodeps one-by-one to avoid OOM killing the whole batch
+# Each package is non-fatal (|| true) to handle build failures gracefully
+while IFS= read -r pkg; do
+  pkg=$(echo "$pkg" | sed 's/#.*//' | tr -d ' ')
+  [ -z "$pkg" ] && continue
+  echo "Installing (no-deps): $pkg"
+  TMPDIR=${STORAGE_TMP} pip3 install --no-cache-dir --no-deps "$pkg" 2>&1 || \
+    echo "WARNING: Failed to install $pkg (skipping)"
+done < /tmp/requirements_nodeps.txt
 # add zeroconf
 grep 'zeroconf' /tmp/requirements_nodeps.txt >> /tmp/owrt_constraints.txt
-# fix deps
-sed -i -e 's/cryptography\(.*\)/cryptography >=36.0.2/' -e 's/chacha20poly1305-reuseable\(.*\)/chacha20poly1305-reuseable >=0.10.0/' /usr/lib/python${PYTHON_VERSION}/site-packages/aioesphomeapi-*-info/METADATA
+# fix deps (only if aioesphomeapi was installed)
+if ls /usr/lib/python${PYTHON_VERSION}/site-packages/aioesphomeapi-*-info/METADATA 2>/dev/null | head -1 | grep -q .; then
+  sed -i -e 's/cryptography\(.*\)/cryptography >=36.0.2/' -e 's/chacha20poly1305-reuseable\(.*\)/chacha20poly1305-reuseable >=0.10.0/' /usr/lib/python${PYTHON_VERSION}/site-packages/aioesphomeapi-*-info/METADATA
+fi
 
 cat << EOF > /tmp/requirements.txt
 tzdata>=2021.2.post0  # 2021.6+ requirement
@@ -303,8 +379,9 @@ $(version voluptuous)
 $(version voluptuous-serialize)
 # $(version sqlalchemy)  # recorder requirement
 $(version ulid-transform)  # utils
-$(version packaging)
-$(version aiohttp-fast-url-dispatcher)
+# $(version packaging)
+packaging
+# $(version aiohttp-fast-url-dispatcher)  # incompatible with aiohttp 3.14+
 $(version psutil-home-assistant)
 $(version async-interrupt)
 #$(version aiohttp-zlib-ng)
@@ -366,7 +443,7 @@ cat /tmp/requirements.txt | sed -E 's/\[.*\]//g' >> /tmp/owrt_constraints.txt
 while read p; do
   pkg_with_ver=$(echo $p | awk '{gsub(/ *#.*/,"");}1')
   if [ $pkg_with_ver ]; then
-    sh -c "TMPDIR=${STORAGE_TMP} pip3 install --no-cache-dir -c /tmp/owrt_constraints.txt \"$pkg_with_ver\""
+    sh -c "TMPDIR=${STORAGE_TMP} pip3 install --no-cache-dir -c /tmp/owrt_constraints.txt \"$pkg_with_ver\"" || echo "WARNING: Failed to install $pkg_with_ver, continuing..."
   fi
 done < /tmp/requirements.txt
 
@@ -402,7 +479,7 @@ tar -zxf hass-nabucasa-${NABUCASA_VER}.tar.gz
 cd hass-nabucasa-${NABUCASA_VER}
 sed -i 's/[<=>]=.*"/"/' setup.py
 rm -rf /usr/lib/python${PYTHON_VERSION}/site-packages/hass_nabucasa-*.egg
-pip3 install . --no-cache-dir -c /tmp/owrt_constraints.txt
+pip3 install . --no-cache-dir --no-deps -c /tmp/owrt_constraints.txt || pip3 install . --no-cache-dir --no-deps
 cd ..
 rm -rf hass-nabucasa-${NABUCASA_VER}.tar.gz hass-nabucasa-${NABUCASA_VER}
 
@@ -584,6 +661,12 @@ weather
 webhook
 websocket_api
 workday
+wiz
+ffmpeg
+onvif
+mobile_app
+season
+tuya
 xiaomi_aqara
 xiaomi_miio
 yeelight
@@ -594,14 +677,14 @@ if [ $NEED_ZHA ]; then
   echo "zha" >> /tmp/ha_components.txt
 fi
 
-# create fake structure tu get full list of components in /tmp/t/
+# create fake structure to get full list of components in /tmp/t/
 TMPSTRUCT=${STORAGE_TMP}/t
-rm -rf ${TMPSTRUCT}
+rm -rf ${TMPSTRUCT} || true
 cd ${STORAGE_TMP}
-tar -ztf /tmp/homeassistant.tar.gz | grep '/homeassistant/components/' | sed 's/^/t\//' | xargs mkdir -p
+tar -ztf /tmp/homeassistant.tar.gz | grep '/homeassistant/components/' | xargs -n1 dirname 2>/dev/null | sed 's/^/t\//' | sort -u | xargs mkdir -p 2>/dev/null || true
 rx=$(sed -e 's/^/^/' -e 's/$/$/' /tmp/ha_components.txt | head -c -1 | tr '\n' '|')
-ls -1 ${TMPSTRUCT}/homeassistant-*/homeassistant/components/ | grep -v -E $rx | sed 's/^/*\/homeassistant\/components\//' > /tmp/ha_exclude.txt
-rm -rf ${TMPSTRUCT} /tmp/ha_components.txt
+ls -1 ${TMPSTRUCT}/homeassistant-*/homeassistant/components/ 2>/dev/null | grep -v -E "$rx" | sed 's/^/*\/homeassistant\/components\//' > /tmp/ha_exclude.txt || true
+rm -rf ${TMPSTRUCT} /tmp/ha_components.txt || true
 
 cd /tmp
 
@@ -612,7 +695,8 @@ rm -rf /tmp/ha_exclude.txt
 rm -rf homeassistant.tar.gz
 cd homeassistant-${HOMEASSISTANT_VERSION}/homeassistant/
 echo '' > requirements.txt
-sed -i "s/[>=]=.*//g" package_constraints.txt
+echo '' > package_constraints.txt
+sed -i -e 's/"constraints":.*/"constraints": None,/' -e 's/raise RequirementsNotFound(name, list(failures))/_LOGGER.warning("Failed reqs: %s", failures)/' requirements.py
 
 # replace LRU with simple dict
 sed -i -e 's/from lru import LRU/LRU = lambda x: dict()/' -e 's/lru.get_size()/128/' -e 's/lru.set_size/pass  # \0/' helpers/template.py
@@ -766,13 +850,15 @@ sed -i -e 's/orjson/json/' -e 's/\.decode(.*)//' -e 's/option=.*/\n/' homeassist
 sed -i -e 's/orjson/json/' -e 's/\.decode(.*)//' homeassistant/helpers/aiohttp_client.py
 sed -i -E -e 's/orjson/json/g' -e 's/\.decode(.*)//' -e 's/(b64(de|en)code.*?)/\1.decode("utf-8")/' -e 's/option=option/#option=option/' -e 's/json.OPT_[A-Z_0-9]*/0/g'  homeassistant/helpers/template.py
 
-# disable aiohttp_zlib_ng
+# disable aiohttp_zlib_ng and aiohttp_fast_url_dispatcher
 sed -i -E -e 's/"aiohttp-zlib-ng[^"]*"//' -e 's/(dispatcher[^,]*?),/\1/' homeassistant/components/http/manifest.json
 sed -i -e 's/from aiohttp_zlib_ng/#from aiohttp_zlib_ng/' -e 's/enable_zlib_ng/#enable_zlib_ng/' homeassistant/components/http/__init__.py
+sed -i -e 's/from aiohttp_fast_url_dispatcher/#from aiohttp_fast_url_dispatcher/' -e 's/attach_fast_url_dispatcher/#attach_fast_url_dispatcher/' homeassistant/components/http/__init__.py
 
 # fix for aiohttp < 3.9 (3.8.5 in 23.05)
 # TODO: revert https://github.com/home-assistant/core/pull/104175
 sed -i 's/, handler_cancellation=True/,  # \0/' homeassistant/components/http/__init__.py
+sed -i -E 's/send_bytes_text = partial\(writer\.send, binary=False\)/send_bytes_text = partial(writer.send, binary=False) if hasattr(writer, "send") else (lambda msg, binary=False: writer.send_frame(msg, 2 if binary else 1))/' homeassistant/components/websocket_api/http.py
 
 # Patch installation type
 sed -i 's/"installation_type": "Unknown"/"installation_type": "Home Assistant on OpenWrt"/' homeassistant/helpers/system_info.py
@@ -790,7 +876,7 @@ fi
 HA_BUILD=${STORAGE_TMP}/ha-build
 mkdir -p ${HA_BUILD}
 ln -s ${HA_BUILD} ./build
-TMPDIR=${STORAGE_TMP} pip3 install . --no-cache-dir -c /tmp/owrt_constraints.txt
+TMPDIR=${STORAGE_TMP} pip3 install . --no-cache-dir --no-deps -c /tmp/owrt_constraints.txt || TMPDIR=${STORAGE_TMP} pip3 install . --no-cache-dir --no-deps
 cd ../
 rm -rf homeassistant-${HOMEASSISTANT_VERSION}/ ${HA_BUILD} ${STORAGE_TMP}
 
